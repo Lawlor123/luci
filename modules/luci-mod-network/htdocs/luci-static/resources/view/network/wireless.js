@@ -129,6 +129,7 @@ function render_network_status(radioNet) {
 	const bssid = radioNet.getActiveBSSID();
 	const channel = radioNet.getChannel();
 	const disabled = (radioNet.get('disabled') == '1' || uci.get('wireless', radioNet.getWifiDeviceName(), 'disabled') == '1');
+	const notes = radioNet.get('notes');	
 	const is_assoc = (bssid && bssid != '00:00:00:00:00:00' && channel && mode != 'Unknown' && !disabled);
 	const is_mesh = (radioNet.getMode() == 'mesh');
 	const changecount = count_changes(radioNet.getName());
@@ -143,6 +144,8 @@ function render_network_status(radioNet) {
 		status_text = E('em', disabled ? _('Wireless is disabled') : _('Wireless is not associated'));
 
 	return L.itemlist(E('div'), [
+		'', null,
+		_('Notes'),       notes,	
 		is_mesh ? _('Mesh ID') : _('SSID'), (is_mesh ? radioNet.getMeshID() : radioNet.getSSID()) ?? '?',
 		_('Mode'),       mode,
 		_('BSSID'),      (!changecount && is_assoc) ? bssid : null,
@@ -265,6 +268,28 @@ function network_updown(id, map, ev) {
 	return map.save().then(function() {
 		ui.changes.apply();
 	});
+}
+
+function change_mac(id, ev) {
+	var radio = uci.get('wireless', id, 'device'),
+		disabled = (uci.get('wireless', id, 'disabled') == '1') ||
+		(uci.get('wireless', radio, 'disabled') == '1');
+
+	var wifiname = uci.get('wireless', id, 'ssid');
+	var args = ['/etc/config/scp/ch_mac.sh', ':', id ];
+
+	if (disabled || (id == 'all')) {
+		return fs.exec('sh', args).then(function(res) {
+			var psout = document.querySelector('.pseudo-output');
+			psout.style.display = '';
+			dom.content(psout, E('pre', [ res.stdout || '', res.stderr || '' ]));
+		}).catch(function(err) {
+			ui.addNotification(null, E('p', [ err ]))
+		});
+	} else {
+		ui.addNotification(null, E('p', {}, _('First, Please disable network') + ' "' + wifiname + '"'));
+		return '';
+	}
 }
 
 function next_free_sid(offset) {
@@ -937,6 +962,10 @@ return view.extend({
 				const isDisabled = (inst.get('disabled') == '1' ||
 					uci.get('wireless', inst.getWifiDeviceName(), 'disabled') == '1');
 
+				if (isDisabled && (uci.get('wireless', section_id, 'mode') == 'sta')) {
+					var isPseudo = (uci.get('network', 'globals', 'Pseudo') == '1');
+				}
+
 				btns = [
 					E('button', {
 						'class': 'cbi-button cbi-button-neutral enable-disable',
@@ -953,6 +982,12 @@ return view.extend({
 						'title': _('Delete this network'),
 						'click': ui.createHandlerFn(this, 'handleRemove', section_id)
 					}, _('Remove'))
+					E('button', {
+						'class': 'cbi-button cbi-button-neutral',
+						'style': isPseudo ? '' : 'display:none',
+						'title': _('Change MAC and Hostname'),
+						'click': ui.createHandlerFn(this, change_mac, section_id)
+					}, _('Pseudo'))					
 				];
 			}
 
@@ -1126,7 +1161,29 @@ return view.extend({
 						return Promise.all(tasks);
 					}, this));
 				};
+				
+				o = ss.taboption('general', form.TextValue, 'notes', _('<abbr title="Optional, notes about this wifinet">Notes</abbr>'));
+				o.optional = true;
+				o.rows = 3;
+				o.cols = 36;
+				o.monospace = true;
+				o.validate = function(section_id, value) {
+					if (value && value.length > 36)
+						return _('Maximum length is %d characters').format(36);
 
+					return true;
+				};
+				o.renderWidget = function(section_id, option_index, cfgvalue) {
+					const node = form.TextValue.prototype.renderWidget.apply(this, arguments);
+					const ta = node.querySelector('textarea');
+					if (ta)
+						ta.setAttribute('maxlength', '36');
+						ta.style.whiteSpace = 'pre-wrap';
+						ta.style.overflowWrap = 'break-word';
+
+					return node;
+				};
+				
 				let encr;
 				if (hwtype == 'mac80211') {
 					const mode = ss.children.find(obj => obj.option === 'mode');
@@ -1324,7 +1381,6 @@ return view.extend({
 
 
 				const crypto_modes = [];
-				const is_6ghz = uci.get('wireless', radioNet.getWifiDeviceName(), 'band') == '6g';
 
 				if (hwtype == 'mac80211') {
 					const has_supplicant = L.hasSystemFeature('wpasupplicant');
@@ -1351,11 +1407,9 @@ return view.extend({
 					const has_sta_wep = L.hasSystemFeature('wpasupplicant', 'wep');
 
 					if (has_hostapd || has_supplicant) {
-						if (!is_6ghz) {
-							crypto_modes.push(['psk2',      'WPA2-PSK',                    35]);
-							crypto_modes.push(['psk-mixed', 'WPA-PSK/WPA2-PSK Mixed Mode', 22]);
-							crypto_modes.push(['psk',       'WPA-PSK',                     12]);
-						}
+						crypto_modes.push(['psk2',      'WPA2-PSK',                    35]);
+						crypto_modes.push(['psk-mixed', 'WPA-PSK/WPA2-PSK Mixed Mode', 22]);
+						crypto_modes.push(['psk',       'WPA-PSK',                     12]);
 					}
 					else {
 						encr.description = _('WPA-Encryption requires wpa_supplicant (for client mode) or hostapd (for AP and ad-hoc mode) to be installed.');
@@ -1363,11 +1417,10 @@ return view.extend({
 
 					if (has_ap_sae || has_sta_sae) {
 						crypto_modes.push(['sae',       'WPA3-SAE',                     31]);
-						if (!is_6ghz)
-							crypto_modes.push(['sae-mixed', 'WPA2-PSK/WPA3-SAE Mixed Mode', 30]);
+						crypto_modes.push(['sae-mixed', 'WPA2-PSK/WPA3-SAE Mixed Mode', 30]);
 					}
 
-					if (!is_6ghz && (has_ap_wep || has_sta_wep)) {
+					if (has_ap_wep || has_sta_wep) {
 						crypto_modes.push(['wep-open',   _('WEP Open System'), 11]);
 						crypto_modes.push(['wep-shared', _('WEP Shared Key'),  10]);
 					}
@@ -1375,15 +1428,12 @@ return view.extend({
 					if (has_ap_eap || has_sta_eap) {
 						if (has_ap_eap192 || has_sta_eap192) {
 							crypto_modes.push(['wpa3', 'WPA3-EAP', 33]);
-							if (!is_6ghz)
-								crypto_modes.push(['wpa3-mixed', 'WPA2-EAP/WPA3-EAP Mixed Mode', 32]);
+							crypto_modes.push(['wpa3-mixed', 'WPA2-EAP/WPA3-EAP Mixed Mode', 32]);
 							crypto_modes.push(['wpa3-192', 'WPA3-EAP 192-bit Mode', 36]);
 						}
 
-						if (!is_6ghz) {
-							crypto_modes.push(['wpa2', 'WPA2-EAP', 34]);
-							crypto_modes.push(['wpa',  'WPA-EAP',  20]);
-						}
+						crypto_modes.push(['wpa2', 'WPA2-EAP', 34]);
+						crypto_modes.push(['wpa',  'WPA-EAP',  20]);
 					}
 
 					if (has_ap_owe || has_sta_owe) {
@@ -1467,8 +1517,7 @@ return view.extend({
 					crypto_modes.push(['wep-shared', _('WEP Shared Key'),         10]);
 				}
 
-				if (!is_6ghz)
-					crypto_modes.push(['none',       _('No Encryption'),   0]);
+				crypto_modes.push(['none',       _('No Encryption'),   0]);
 
 				crypto_modes.sort(function(a, b) { return b[2] - a[2]; });
 
@@ -2426,7 +2475,29 @@ return view.extend({
 
 			cbi_update_table(table, [], E('em', { 'class': 'spinning' }, _('Collecting data...')));
 
-			return E([ nodes, E('h3', _('Associated Stations')), table ]);
+			var isPseudo = (uci.get('network', 'globals', 'Pseudo') == '1');
+
+			var psbtns = E('div', {'style': isPseudo ? 'padding-right:0px' : 'display:none' },
+				E('table', { 'class': 'table cbi-section-table' }, [
+					E('tr', { 'class': 'tr table-titles' }, [
+						E('td', { 'class': 'td cbi-value-field' }),
+						E('td', { 'class': 'td middle cbi-section-actions', 'width':'25%' },
+							E('div', {},
+								E('button', {
+									'class': 'cbi-button cbi-button-neutral fade-in',
+									'title': _('Change the mac and hostname of all wifinet'),
+									'click': ui.createHandlerFn(this, change_mac, 'all')
+								}, _('Pseudo all wifinet'))
+							)
+						)
+					]),
+					E('tr', { 'class': 'tr table-titles' },
+						E('td', { 'class': 'td cbi-value-field pseudo-output', 'colspan':'2', 'style': 'display:none' })
+					)
+				])
+			);
+
+			return E([ psbtns, nodes, E('h3', _('Associated Stations')), table ]);
 		}, this, m));
 	},
 
